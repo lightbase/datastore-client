@@ -9,8 +9,6 @@ Note that CKAN DataStore is, in essence, ElasticSearch so you can use any
 ElasticSearch client (http://www.elasticsearch.org/guide/appendix/clients.html)
 to interact with it.
 '''
-import os
-os.environ['http_proxy'] = ''
 import urlparse
 import mimetypes
 import os
@@ -20,6 +18,7 @@ import json
 import csv
 import time
 import logging
+import ast
 
 logger = logging.getLogger('datastore.client')
 
@@ -35,11 +34,10 @@ class DataStoreClient:
             # get rid of username:password@ in netloc
             self.netloc = self.parsed.netloc.split('@')[1]
             newparsed[1] = self.netloc
-        if self.parsed.path.startswith('/dataset'):
-            newparsed[2] = '/api/data/%s' % self.parsed.path.rstrip('/').split('/')[-1]
         self.url = urlparse.urlunparse(newparsed)
         # elastic search type name
         self.es_type_name = self.parsed.path.split('/')[-1] 
+        self.es_indice_name = self.parsed.path.split('/')[-1] 
         self._setup_authorization(username)
 
     def query(self, query):
@@ -51,19 +49,13 @@ class DataStoreClient:
         url = self.url + '/_search'
         q = json.dumps(query)
         req = urllib2.Request(url, q, self._headers)
-        try:
-            out = urllib2.urlopen(req).read()
-        except Exception, inst:
-            logger.error('%s: %s' % (inst.url, inst.read()))
-            raise
+        out = urllib2.urlopen(req).read()
         return json.loads(out)
 
-    def upsert(self, dict_iterator, refresh=False):
+    def upsert(self, dict_iterator):
         '''Insert / update documents provided in dict_iterator.'''
         start = time.time()
         url = self.url + '/_bulk'
-        if refresh:
-            url += '?refresh=true'
 
         def send_request(data):
             post_data = "%s%s" % ("\n".join(data), "\n")
@@ -72,8 +64,16 @@ class DataStoreClient:
 
         data = []
         for count,dict_ in enumerate(dict_iterator):
+            # data.append(json.dumps({"index": {"_id": count+1}}))
+
             bulkmeta = {"index": {}}
-            if 'id' in dict_: bulkmeta['index']['_id'] = dict_['id']
+            # Eduardo: 2012-09-05
+            # Enumerator returns dict as string. We have to convert so it works
+            dict_ = ast.literal_eval(dict_)
+            
+            if 'id' in dict_: 
+                bulkmeta['index']['_id'] = dict_['id']
+            
             data.append(json.dumps(bulkmeta))
             data.append(json.dumps(dict_))
             if (count % 100) == 0:
@@ -84,7 +84,7 @@ class DataStoreClient:
             send_request(data)
             logger.debug('%s %s' % (count, (time.time() - start)))
 
-    def upload(self, filepath_or_fileobj, filetype=None, **kwargs):
+    def upload(self, filepath_or_fileobj, filetype=None):
         '''Upload data to webstore table. Additional required arguments is file path
         with data to upload and optional {filetype} giving type of file.
         '''
@@ -102,10 +102,13 @@ class DataStoreClient:
 
     def delete(self):
         '''Delete this DataStore table.'''
-        logger.debug('DELETE: %s' % self.url)
-        out = self._request(self.url, None, 'DELETE')
-        logger.debug('DELETE: %s' % out)
-        return out
+        opener = urllib2.build_opener(urllib2.HTTPHandler)
+        request = urllib2.Request(self.url)
+        if self.authorization:
+            request.add_header('Authorization', self.authorization)
+        request.get_method = lambda: 'DELETE'
+        response = opener.open(request)
+        return response.read()
 
     def mapping(self):
         '''Get the mapping for this DataStore table.'''
@@ -135,7 +138,76 @@ class DataStoreClient:
             raise
         logger.debug('%s: %s' % (url, out))
         return out
+
+    def settings(self):
+        '''Update settings for this index.'''
+        url = self.url + '/_settings'
+        req = urllib2.Request(url, None, self._headers)
+        data = urllib2.urlopen(req).read()
+        data = json.loads(data)
+        return data
+
+    def settings_update(self, settings):
+        '''Update the settings for this DataStore indice.
         
+        @param settings: settings dict for this type as per
+		http://www.elasticsearch.org/guide/reference/api/admin-indices-create-index.html
+
+        Note that you need not (and should not) include the indice name, i.e. we
+        will PUT to settings API:
+
+        {indice}: {settings}
+        '''
+        # Close index first
+        url_close = self.url + '/_close'
+        try:
+            out = self._request(url_close, {}, 'POST')
+        except Exception, inst:
+            logger.error('%s: %s' % (inst.url, inst.read()))
+            raise
+        logger.debug('%s: %s' % (url_close, out))
+
+        url = self.url + '/_settings'
+        data = json.dumps(settings)
+        try:
+            out = self._request(url, data, 'PUT')
+        except Exception, inst:
+            logger.error('%s: %s' % (inst.url, inst.read()))
+            raise
+        logger.debug('%s: %s' % (url, out))
+
+        # Now open index
+        url_open = self.url + '/_open'
+        try:
+            out = self._request(url_open, {}, 'POST')
+        except Exception, inst:
+            logger.error('%s: %s' % (inst.url, inst.read()))
+            raise
+        logger.debug('%s: %s' % (url_open, out))
+
+        return out
+
+    def index_create(self, settings):
+        '''Update the settings for this DataStore indice.
+        
+        @param settings: settings dict for this type as per
+		http://www.elasticsearch.org/guide/reference/api/admin-indices-create-index.html
+
+        Note that you need not (and should not) include the indice name, i.e. we
+        will PUT to settings API:
+
+        {indice}: {settings}
+        '''
+        url = self.url
+        data = json.dumps(settings)
+        try:
+            out = self._request(url, data, 'PUT')
+        except Exception, inst:
+            logger.error('%s: %s' % (inst.url, inst.read()))
+            raise
+        logger.debug('%s: %s' % (url, out))
+        return out
+
     def _request(self, url, data, method):
         opener = urllib2.build_opener(urllib2.HTTPHandler)
         request = urllib2.Request(url, data, self._headers)
@@ -170,20 +242,13 @@ class DataStoreClient:
                 return api_key
 
 class TestItOut:
-    base_url = 'http://localhost:9200/datastore-client-test'
+    base_url = 'http://localhost:9200/api/data'
 
     def test_url_parse(self):
-        url = 'http://abc@localhost:8088/api/data/75328a3a-e566-4993-9115-6e915ed7362c'
+        url = 'http://abc@localhost/api/data/75328a3a-e566-4993-9115-6e915ed7362c'
         client = DataStoreClient(url)
-        assert client.netloc == 'localhost:8088'
+        assert client.netloc == 'localhost'
         assert client.authorization == 'abc'
-        assert client.es_type_name == '75328a3a-e566-4993-9115-6e915ed7362c' 
-
-        url = 'http://abc@localhost:8088/dataset/xyz/resource/75328a3a-e566-4993-9115-6e915ed7362c'
-        client = DataStoreClient(url)
-        assert client.netloc == 'localhost:8088'
-        assert client.authorization == 'abc'
-        assert client.url == 'http://localhost:8088/api/data/75328a3a-e566-4993-9115-6e915ed7362c' 
         assert client.es_type_name == '75328a3a-e566-4993-9115-6e915ed7362c' 
 
     def test_delete(self):
@@ -200,113 +265,22 @@ class TestItOut:
         client = DataStoreClient(url)
         client.upload(data, filetype='json')
 
-    query_data = [
-            {"a": 'john', "b": 2, "c": "UK"},
-            {"a": 'jane', "b": 5, "c": "UK"},
-            {"a": 'john', "b": 7, "c": "DE"}
-        ]
-
     def test_query(self):
-        url = self.base_url + '/query-test'
+        url = self.base_url + '/update-test'
+        data = [
+            {"a": 1, "b": 2, "c": "UK"},
+            {"a": 2, "b": 5, "c": "UK"},
+            {"a": 2, "b": 5, "c": "DE"}
+        ]
         client = DataStoreClient(url)
-        client.delete()
-        client.upsert(self.query_data, refresh=True)
+        client.upsert(data)
         query = {
             'query': { 
                 'match_all': {}
             }
         }
         out = client.query(query)
-        import pprint
-        assert out['hits']['total'] == 3, pprint.pprint(out)
-
-        query = {
-            'query': {
-                'constant_score': { 
-                    'filter': {
-                        'term': {
-                            # must be lower-case!
-                            'c': 'uk'
-                        }
-                    }
-                }
-            }
-        }
-        out = client.query(query)
-        assert out['hits']['total'] == 2, pprint.pprint(out)
-
-        query = {
-            'query': {
-                "constant_score" : {
-                    "filter" : {
-                        "range" : {
-                            "b" : { 
-                                "from" : 4, 
-                                "to" : "8"
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        out = client.query(query)
-        assert out['hits']['total'] == 2, pprint.pprint(out)
-
-        query = {
-            'query': {
-                "range" : {
-                    "b" : { 
-                        "from" : 4, 
-                        "to" : "8"
-                    }
-                }
-            }
-        }
-        out = client.query(query)
-        assert out['hits']['total'] == 2, pprint.pprint(out)
-
-        query = {
-            "query": {
-                "filtered": {
-                    "query": {
-                        "match_all": {}
-                    },
-                    "filter": {
-                        "and": [
-                            {
-                                "range" : {
-                                    "b" : { 
-                                        "from" : 4, 
-                                        "to" : "8"
-                                    }
-                                },
-                            },
-                            {
-                                "term": {
-                                    "a": "john"
-                                }
-                            }
-                        ]
-                    }
-                }
-            }
-        }
-        out = client.query(query)
-        assert out['hits']['total'] == 1, pprint.pprint(out)
-
-    def test_query_facet(self):
-        url = self.base_url + '/query-test'
-        client = DataStoreClient(url)
-        client.delete()
-        client.upsert(self.query_data, refresh=True)
-        query = {
-            'query': { 
-                'match_all': {}
-            }
-        }
-        out = client.query(query)
-        import pprint
-        assert out['hits']['total'] == 3, pprint.pprint(out)
+        assert out['hits']['total']
 
     def test_mapping(self):
         url = self.base_url + '/mapping-test'
